@@ -22,6 +22,9 @@ import pickle
 from dataclasses import dataclass, asdict
 from typing import List, Tuple
 
+# Enable bf16 training for speed
+jax.config.update("jax_default_matmul_precision", "bfloat16")
+
 
 # ============================================================================
 # CONFIG
@@ -409,9 +412,173 @@ def load_reward_model(path: str):
 
 
 # ============================================================================
-# POLICY MODEL (same as before)
+# POLICY MODEL
 # ============================================================================
 
+# ============================================================================
+# VQ POLICY (matching pretrain_visual.py architecture exactly)
+# ============================================================================
+
+class ResBlock(nn.Module):
+    """Residual block with GroupNorm (matches pretrain_visual.py)."""
+    channels: int
+
+    @nn.compact
+    def __call__(self, x, train: bool = True):
+        h = nn.GroupNorm(num_groups=min(8, self.channels))(x)
+        h = nn.silu(h)
+        h = nn.Conv(self.channels, (3, 3), padding='SAME')(h)
+        h = nn.GroupNorm(num_groups=min(8, self.channels))(h)
+        h = nn.silu(h)
+        h = nn.Conv(self.channels, (3, 3), padding='SAME')(h)
+
+        if x.shape[-1] != self.channels:
+            x = nn.Conv(self.channels, (1, 1))(x)
+
+        return x + h
+
+
+class Encoder(nn.Module):
+    """VQ-VAE encoder (matches pretrain_visual.py exactly)."""
+    channels: tuple = (32, 64, 128, 192)
+    embed_dim: int = 192
+
+    @nn.compact
+    def __call__(self, x, train: bool = True):
+        x = x.astype(jnp.float32) / 255.0
+
+        for ch in self.channels:
+            x = nn.Conv(ch, (4, 4), strides=(2, 2), padding='SAME')(x)
+            x = ResBlock(ch)(x, train)
+
+        x = nn.Conv(self.embed_dim, (1, 1))(x)
+        return x  # (B, 9, 10, embed_dim)
+
+
+class VectorQuantizer(nn.Module):
+    """Vector quantization (matches pretrain_visual.py exactly)."""
+    vocab_size: int = 512
+    embed_dim: int = 192
+
+    @nn.compact
+    def __call__(self, z, train: bool = True):
+        B, H, W, D = z.shape
+
+        codebook = self.param(
+            'codebook',
+            nn.initializers.variance_scaling(1.0, 'fan_in', 'uniform'),
+            (self.vocab_size, self.embed_dim)
+        )
+
+        z_flat = z.reshape(-1, D)
+        z_sq = jnp.sum(z_flat ** 2, axis=1, keepdims=True)
+        e_sq = jnp.sum(codebook ** 2, axis=1, keepdims=True).T
+        distances = z_sq + e_sq - 2 * jnp.dot(z_flat, codebook.T)
+
+        indices = jnp.argmin(distances, axis=1).reshape(B, H, W)
+        z_q = codebook[indices.reshape(-1)].reshape(B, H, W, D)
+
+        # Straight-through
+        z_q = z + jax.lax.stop_gradient(z_q - z)
+        return z_q, indices
+
+
+class TransformerBlock(nn.Module):
+    """Transformer block (matches pretrain_visual.py exactly)."""
+    embed_dim: int
+    num_heads: int = 4
+    mlp_ratio: int = 3
+
+    @nn.compact
+    def __call__(self, x, train: bool = True):
+        # Self-attention
+        y = nn.LayerNorm()(x)
+        y = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            qkv_features=self.embed_dim,
+        )(y, y)
+        y = nn.Dropout(0.1, deterministic=not train)(y)
+        x = x + y
+
+        # MLP
+        y = nn.LayerNorm()(x)
+        y = nn.Dense(self.embed_dim * self.mlp_ratio)(y)
+        y = nn.gelu(y)
+        y = nn.Dropout(0.1, deterministic=not train)(y)
+        y = nn.Dense(self.embed_dim)(y)
+        y = nn.Dropout(0.1, deterministic=not train)(y)
+        x = x + y
+
+        return x
+
+
+class VQPolicy(nn.Module):
+    """
+    Policy using pretrained VQ-VAE encoder + dynamics transformer backbone.
+
+    Architecture (matches pretrain_visual.py):
+      Frame -> Encoder -> VectorQuantizer -> pos_embed -> TransformerBlocks -> LayerNorm
+           -> Action/Value heads (replacing vocab prediction head)
+
+    All components (encoder, quantizer, transformer) are finetuned with RL.
+    """
+    vocab_size: int = 512
+    embed_dim: int = 192
+    encoder_channels: tuple = (32, 64, 128, 192)
+    num_layers: int = 4
+    num_heads: int = 4
+    mlp_ratio: int = 3
+    num_actions: int = 8
+    num_tokens: int = 90  # 9 * 10
+
+    @nn.compact
+    def __call__(self, frames, train: bool = True):
+        B = frames.shape[0]
+
+        # === ENCODER (from tokenizer) ===
+        z = Encoder(
+            channels=self.encoder_channels,
+            embed_dim=self.embed_dim,
+        )(frames, train)
+
+        # === QUANTIZER (from tokenizer) ===
+        z_q, tokens = VectorQuantizer(
+            vocab_size=self.vocab_size,
+            embed_dim=self.embed_dim,
+        )(z, train)
+
+        # Flatten to sequence: (B, 9, 10, D) -> (B, 90, D)
+        token_embeds = z_q.reshape(B, self.num_tokens, self.embed_dim)
+
+        # === TRANSFORMER (from dynamics model) ===
+        # Add positional embeddings
+        pos_embed = self.param(
+            'pos_embed',
+            nn.initializers.normal(0.02),
+            (1, self.num_tokens, self.embed_dim)
+        )
+        x = token_embeds + pos_embed
+
+        # Transformer blocks
+        for _ in range(self.num_layers):
+            x = TransformerBlock(
+                embed_dim=self.embed_dim,
+                num_heads=self.num_heads,
+                mlp_ratio=self.mlp_ratio,
+            )(x, train)
+
+        # Final LayerNorm (same as dynamics model)
+        x = nn.LayerNorm()(x)
+
+        # === POLICY/VALUE HEADS (replacing Dense(vocab)) ===
+        pooled = jnp.mean(x, axis=1)  # (B, embed_dim)
+        policy_logits = nn.Dense(self.num_actions, name='policy_head')(pooled)
+        value = nn.Dense(1, name='value_head')(pooled).squeeze(-1)
+
+        return policy_logits, value
+
+
+# Legacy ViT-based model (kept for backward compatibility)
 class PatchEmbed(nn.Module):
     patch_size: int = 8
     embed_dim: int = 256
@@ -428,7 +595,8 @@ class PatchEmbed(nn.Module):
         return x.reshape(B, -1, self.embed_dim)
 
 
-class TransformerBlock(nn.Module):
+class LegacyTransformerBlock(nn.Module):
+    """Legacy ViT transformer block (kept for backward compatibility)."""
     embed_dim: int = 256
     num_heads: int = 4
 
@@ -462,7 +630,7 @@ class VisionEncoder(nn.Module):
                                (1, x.shape[1], self.embed_dim))
         x = x + pos_embed
         for _ in range(self.num_layers):
-            x = TransformerBlock(self.embed_dim, self.num_heads)(x, train)
+            x = LegacyTransformerBlock(self.embed_dim, self.num_heads)(x, train)
         return nn.LayerNorm()(x)
 
 
@@ -499,6 +667,7 @@ class LanguageDecoder(nn.Module):
 
 
 class SmallVLMPolicy(nn.Module):
+    """Legacy ViT-based policy (kept for backward compatibility)."""
     embed_dim: int = 256
     vision_layers: int = 6
     decoder_layers: int = 2
@@ -523,27 +692,71 @@ class SmallVLMPolicy(nn.Module):
 # TRAINING
 # ============================================================================
 
-def create_train_state(config: Config, key, pretrained_encoder=None):
-    model = SmallVLMPolicy(
-        embed_dim=config.embed_dim,
-        vision_layers=config.vision_layers,
-        decoder_layers=config.decoder_layers,
-        num_heads=config.num_heads,
-        num_actions=config.num_actions,
-        patch_size=config.patch_size,
-    )
-    dummy = jnp.zeros((1, 144, 160, 3), dtype=jnp.uint8)
-    params = model.init(key, dummy)
+def create_train_state(config: Config, key, pretrained_tokenizer=None, pretrained_dynamics=None):
+    """
+    Create training state with policy model.
 
-    # Replace encoder with pretrained weights if provided
-    if pretrained_encoder is not None:
+    If pretrained_tokenizer is provided, loads encoder + quantizer weights.
+    If pretrained_dynamics is also provided, loads transformer weights.
+    Otherwise, uses legacy SmallVLMPolicy (ViT-based).
+    """
+    dummy = jnp.zeros((1, 144, 160, 3), dtype=jnp.uint8)
+
+    if pretrained_tokenizer is not None:
+        # Get config from tokenizer
+        tok_config = pretrained_tokenizer.get('config', {})
+        vocab_size = tok_config.get('vocab_size', 512)
+        embed_dim = tok_config.get('embed_dim', 192)
+        encoder_channels = tuple(tok_config.get('encoder_channels', (32, 64, 128, 192)))
+        num_tokens = tok_config.get('token_grid', (9, 10))
+        if isinstance(num_tokens, (list, tuple)):
+            num_tokens = num_tokens[0] * num_tokens[1]
+
+        model = VQPolicy(
+            vocab_size=vocab_size,
+            embed_dim=embed_dim,
+            encoder_channels=encoder_channels,
+            num_layers=4,
+            num_heads=4,
+            mlp_ratio=3,
+            num_actions=config.num_actions,
+            num_tokens=num_tokens,
+        )
+        params = model.init(key, dummy)
+
+        # Load pretrained weights
         params = flax.core.unfreeze(params)
-        if 'params' in params:
-            params['params']['VisionEncoder_0'] = pretrained_encoder
-        else:
-            params['VisionEncoder_0'] = pretrained_encoder
+        tok_params = pretrained_tokenizer['params']['params']
+
+        # Load encoder and quantizer from tokenizer
+        params['params']['Encoder_0'] = tok_params['encoder']
+        params['params']['VectorQuantizer_0'] = tok_params['quantizer']
+        print("  Loaded encoder + quantizer from tokenizer")
+
+        # Load transformer from dynamics if provided
+        if pretrained_dynamics is not None:
+            dyn_params = pretrained_dynamics['params']['params']
+            # Copy pos_embed, TransformerBlocks, LayerNorm (skip Dense_0)
+            params['params']['pos_embed'] = dyn_params['pos_embed']
+            for i in range(4):
+                params['params'][f'TransformerBlock_{i}'] = dyn_params[f'TransformerBlock_{i}']
+            params['params']['LayerNorm_0'] = dyn_params['LayerNorm_0']
+            print("  Loaded transformer from dynamics model")
+
         params = flax.core.freeze(params)
-        print("  Pretrained encoder weights loaded!")
+        print(f"  VQPolicy ready: vocab={vocab_size}, embed={embed_dim}, tokens={num_tokens}")
+    else:
+        # Use legacy ViT-based policy
+        model = SmallVLMPolicy(
+            embed_dim=config.embed_dim,
+            vision_layers=config.vision_layers,
+            decoder_layers=config.decoder_layers,
+            num_heads=config.num_heads,
+            num_actions=config.num_actions,
+            patch_size=config.patch_size,
+        )
+        params = model.init(key, dummy)
+        print("  Using ViT-based policy (no pretrained weights)")
 
     tx = optax.chain(
         optax.clip_by_global_norm(0.5),
@@ -556,16 +769,23 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--reward-model", type=str, required=True,
-                        help="Path to trained CNN reward model")
-    parser.add_argument("--pretrained-encoder", type=str, default=None,
-                        help="Path to pretrained visual encoder weights")
+                        help="Path to trained CNN reward model (frozen)")
+    parser.add_argument("--pretrained-tokenizer", type=str, default=None,
+                        help="Path to pretrained tokenizer (encoder + quantizer)")
+    parser.add_argument("--pretrained-dynamics", type=str, default=None,
+                        help="Path to pretrained dynamics model (transformer)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from")
     parser.add_argument("--rom", default="roms/Pokemon - Red Version (USA, Europe) (SGB Enhanced).gb")
-    parser.add_argument("--iterations", type=int, default=50000)
+    parser.add_argument("--iterations", type=int, default=12000,
+                        help="Total iterations (default 12000 ≈ 12 hours)")
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--return-filter", type=float, default=0.0,
                         help="Only train on top X%% of returns (0 = no filtering, 0.8 = top 80%%)")
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-resume", type=str, default=None,
+                        help="Wandb run ID to resume")
     args = parser.parse_args()
 
     config = Config(num_envs=args.num_envs)
@@ -588,17 +808,28 @@ def main():
     test_score = compute_rewards(test_frame)
     print(f"Reward model test score: {float(test_score[0]):.4f}")
 
-    # Initialize wandb
+    # Initialize wandb with full config
     wandb_run = None
     if not args.no_wandb:
         try:
             import wandb
-            run_name = args.wandb_run_name or f"cnn-reward-{config.num_envs}env-{int(time.time())}"
+            run_name = args.wandb_run_name or f"vq-policy-{config.num_envs}env-{int(time.time())}"
+            wandb_config = {
+                **asdict(config),
+                'reward_model': args.reward_model,
+                'pretrained_tokenizer': args.pretrained_tokenizer,
+                'pretrained_dynamics': args.pretrained_dynamics,
+                'return_filter': args.return_filter,
+                'total_iterations': args.iterations,
+                'architecture': 'VQPolicy' if args.pretrained_tokenizer else 'SmallVLMPolicy',
+            }
             wandb_run = wandb.init(
                 project=config.wandb_project,
                 name=run_name,
-                config=asdict(config),
-                tags=["pokemon-red", "cnn-reward", "ppo"],
+                config=wandb_config,
+                tags=["pokemon-red", "vq-policy", "ppo", "pretrained"],
+                resume="allow" if args.wandb_resume else None,
+                id=args.wandb_resume,
             )
             print(f"Wandb: {wandb_run.url}")
         except Exception as e:
@@ -619,17 +850,33 @@ def main():
     # Initialize policy
     key = jax.random.PRNGKey(int(time.time()))
 
-    # Load pretrained encoder if provided (before creating train state)
-    pretrained_encoder = None
-    if args.pretrained_encoder:
-        print(f"Loading pretrained encoder: {args.pretrained_encoder}")
-        with open(args.pretrained_encoder, 'rb') as f:
-            pretrained = pickle.load(f)
-        pretrained_encoder = pretrained['encoder_params']
+    # Load pretrained weights
+    pretrained_tokenizer = None
+    pretrained_dynamics = None
 
-    state = create_train_state(config, key, pretrained_encoder)
+    if args.pretrained_tokenizer:
+        print(f"Loading pretrained tokenizer: {args.pretrained_tokenizer}")
+        with open(args.pretrained_tokenizer, 'rb') as f:
+            pretrained_tokenizer = pickle.load(f)
+
+    if args.pretrained_dynamics:
+        print(f"Loading pretrained dynamics: {args.pretrained_dynamics}")
+        with open(args.pretrained_dynamics, 'rb') as f:
+            pretrained_dynamics = pickle.load(f)
+
+    state = create_train_state(config, key, pretrained_tokenizer, pretrained_dynamics)
     num_params = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
     print(f"Policy parameters: {num_params:,}")
+
+    # Resume from checkpoint if provided
+    start_iteration = 0
+    if args.resume:
+        print(f"Resuming from checkpoint: {args.resume}")
+        with open(args.resume, 'rb') as f:
+            checkpoint = pickle.load(f)
+        state = state.replace(params=checkpoint['params'])
+        start_iteration = checkpoint.get('iteration', 0)
+        print(f"  Resumed at iteration {start_iteration}")
 
     # JIT compile policy functions
     @jax.jit
@@ -642,9 +889,9 @@ def main():
         return action, log_prob, value
 
     @jax.jit
-    def ppo_update(state, frames, actions, returns, old_log_probs):
+    def ppo_update(state, frames, actions, returns, old_log_probs, rng_key):
         def loss_fn(params):
-            logits, values = state.apply_fn(params, frames, train=True)
+            logits, values = state.apply_fn(params, frames, train=True, rngs={'dropout': rng_key})
 
             # Clip logits to prevent numerical instability (extreme softmax outputs)
             logits = jnp.clip(logits, -20.0, 20.0)
@@ -686,7 +933,7 @@ def main():
     env.reset(obs)
 
     print(f"\nTraining config:")
-    print(f"  Iterations: {args.iterations}")
+    print(f"  Iterations: {start_iteration} -> {args.iterations}")
     print(f"  Envs: {config.num_envs}")
     print(f"  Trajectory: {config.trajectory_length} steps")
     print(f"  Reward computed every {config.reward_interval} steps")
@@ -695,7 +942,7 @@ def main():
     start_time = time.time()
     total_frames = 0
 
-    for iteration in range(args.iterations):
+    for iteration in range(start_iteration, args.iterations):
         t0 = time.time()
 
         # === ROLLOUT ===
@@ -806,12 +1053,14 @@ def main():
         for mb_idx, start in enumerate(range(0, B, config.minibatch_size)):
             end = min(start + config.minibatch_size, B)
             idx = perm[start:end]
+            key, dropout_key = jax.random.split(key)
             state, metrics = ppo_update(
                 state,
                 frames_flat[idx],
                 actions_flat[idx],
                 returns_flat[idx],
-                log_probs_flat[idx]
+                log_probs_flat[idx],
+                dropout_key
             )
             metrics_list.append(metrics)
 
@@ -855,12 +1104,16 @@ def main():
                     "checkpoints/resets_this_iter": num_resets,
                 }, step=iteration)
 
-        # Checkpoints
-        if iteration % config.checkpoint_interval == 0 and iteration > 0:
+        # Checkpoints (save every checkpoint_interval iterations)
+        if iteration % config.checkpoint_interval == 0 and iteration > start_iteration:
             os.makedirs("checkpoints", exist_ok=True)
-            checkpoint_path = f"checkpoints/policy_cnn_{iteration}.pkl"
+            checkpoint_path = f"checkpoints/policy_{iteration}.pkl"
             with open(checkpoint_path, 'wb') as f:
-                pickle.dump({'params': state.params, 'config': asdict(config)}, f)
+                pickle.dump({
+                    'params': state.params,
+                    'config': asdict(config),
+                    'iteration': iteration,
+                }, f)
             print(f"  → Saved {checkpoint_path}")
 
             # Save checkpoint frames for visual review
@@ -879,7 +1132,11 @@ def main():
 
     # Save final policy
     with open("checkpoints/policy_final.pkl", 'wb') as f:
-        pickle.dump({'params': state.params, 'config': asdict(config)}, f)
+        pickle.dump({
+            'params': state.params,
+            'config': asdict(config),
+            'iteration': args.iterations,
+        }, f)
     print(f"  → Saved checkpoints/policy_final.pkl")
 
     if wandb_run:
