@@ -12,6 +12,7 @@ dependencies = [
     "wandb>=0.16",
     "yt-dlp>=2024.1",
     "opencv-python>=4.8",
+    "emurust",
 ]
 
 [project.optional-dependencies]
@@ -19,15 +20,6 @@ dev = [
     "pytest>=7.0",
     "black>=23.0",
     "ruff>=0.1",
-]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.uv]
-dev-dependencies = [
-    "emurust",
 ]
 
 [tool.uv.sources]
