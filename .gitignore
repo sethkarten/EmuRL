@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Data (large files)
+data/
+*.pkl
+*.npy
+
+# Checkpoints
+checkpoints/
+wandb/
+eval_output/
+
+# ROMs (copyrighted)
+roms/
+*.gb
+*.gbc
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Misc
+*.png
+*.log
+uv.lock
