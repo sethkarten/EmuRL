@@ -169,9 +169,31 @@ reward = progress_delta - time_penalty
 - [x] Keep legacy ViT policy for backward compatibility
 - [ ] Verify return filtering works (--return-filter 0.8)
 
+### DONE: OOD Detection for Counterfactual States
+- [x] Created `ood_detector.py` for detecting out-of-distribution states
+- [x] Reconstruction-based OOD: VQ-VAE reconstruction error
+- [x] Temporal OOD: Dynamics model prediction accuracy
+- [x] Combined scoring with reward multipliers
+- **Usage**: Penalize rewards when agent visits states speedrunners never do
+
+```python
+from ood_detector import OODDetector
+detector = OODDetector.from_tokenizer("pretrained_tokenizer.pkl", "pretrained_dynamics.pkl")
+ood_scores = detector.compute_combined_ood_scores(frames_t, frames_t1)
+reward_mult = detector.get_reward_multiplier(ood_scores)
+adjusted_rewards = rewards * reward_mult
+```
+
+### IN PROGRESS: Expand Training Data
+- [x] Scraped 1505 speedrun video URLs from speedrun.com API
+- [x] Created `scrape_speedruns.py` for video download and frame extraction
+- [ ] Download 50 videos to `/mnt/storage/datasets/pokemon_red_speedruns/`
+- [ ] Extract frames at 2 FPS
+- [ ] Retrain reward model on expanded data
+
 ### TODO: Fix intro problem
 - Agent gets stuck in title screen (never presses Start)
-- Solution: Pretrained encoder should help (understands game visuals from speedruns)
+- Solution: Expanded data + OOD penalty should help guide agent past intro
 
 ### TODO: Evaluation
 - [ ] Compare trained vs random agent
@@ -216,6 +238,31 @@ uv run python train_with_cnn_reward.py \
 
 # Evaluate
 uv run python evaluate_policy.py --policy checkpoints/policy_final.pkl --steps 2000
+
+# === DATA EXPANSION ===
+
+# Fetch speedrun metadata from speedrun.com
+uv run python scrape_speedruns.py --fetch-runs --output data/speedrun_metadata.json
+
+# Download speedrun videos (720p max)
+uv run python scrape_speedruns.py --download \
+    --metadata data/speedrun_metadata.json \
+    --videos /mnt/storage/datasets/pokemon_red_speedruns/videos \
+    --max-videos 50
+
+# Extract frames from videos
+uv run python scrape_speedruns.py --extract-frames \
+    --videos /mnt/storage/datasets/pokemon_red_speedruns/videos \
+    --frames /mnt/storage/datasets/pokemon_red_speedruns/frames
+
+# === OOD DETECTION ===
+
+# Calibrate OOD detector on speedrun data
+uv run python ood_detector.py --tokenizer pretrained_tokenizer.pkl --calibrate
+
+# Test temporal OOD with dynamics model
+uv run python ood_detector.py --tokenizer pretrained_tokenizer.pkl \
+    --dynamics pretrained_dynamics.pkl --test-temporal
 ```
 
 ---

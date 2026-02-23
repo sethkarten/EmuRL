@@ -25,6 +25,56 @@ from typing import List, Tuple
 # Enable bf16 training for speed
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
+# Multi-GPU setup
+NUM_DEVICES = jax.local_device_count()
+print(f"JAX devices: {NUM_DEVICES} GPUs available")
+
+
+# ============================================================================
+# BLANK FRAME DETECTION
+# ============================================================================
+
+def is_blank_frame(frame: np.ndarray, threshold: float = 20.0) -> bool:
+    """Check if a single frame is blank (all black, all white, or very low variance)."""
+    if frame.max() - frame.min() < threshold:
+        return True
+    if frame.var() < 100:
+        return True
+    return False
+
+
+def get_blank_mask(frames: np.ndarray, threshold: float = 20.0) -> np.ndarray:
+    """Get boolean mask of blank frames. Shape: (N,)"""
+    # frames: (N, H, W, C)
+    # Check variance per frame
+    var_per_frame = frames.var(axis=(1, 2, 3))
+    range_per_frame = frames.max(axis=(1, 2, 3)) - frames.min(axis=(1, 2, 3))
+    blank_mask = (var_per_frame < 100) | (range_per_frame < threshold)
+    return blank_mask
+
+
+BLANK_FRAME_SCORE = -10.0  # Score to assign to blank frames
+
+
+# ============================================================================
+# GAMEBOY BUTTON MAPPING
+# ============================================================================
+# The emulator uses a bitmask for buttons, where:
+# Bit 0 = Right, Bit 1 = Left, Bit 2 = Up, Bit 3 = Down
+# Bit 4 = A, Bit 5 = B, Bit 6 = Select, Bit 7 = Start
+
+# Map action indices 0-7 to proper button bitmasks
+ACTION_TO_BUTTON = np.array([
+    1,    # 0: Right (bit 0)
+    2,    # 1: Left (bit 1)
+    4,    # 2: Up (bit 2)
+    8,    # 3: Down (bit 3)
+    16,   # 4: A (bit 4)
+    32,   # 5: B (bit 5)
+    64,   # 6: Select (bit 6)
+    128,  # 7: Start (bit 7)
+], dtype=np.uint8)
+
 
 # ============================================================================
 # CONFIG
@@ -57,6 +107,10 @@ class Config:
     minibatch_size: int = 64  # Reduced for GPU memory
     time_penalty: float = 0.001  # Cost per step to encourage faster progress
 
+    # Exploration bonus
+    novelty_coef: float = 0.5  # Bonus for reaching new score levels
+    novelty_bucket_size: float = 0.5  # Score bucket size for novelty tracking
+
     # Progress checkpointing (for curriculum learning)
     checkpoint_progress_threshold: float = 0.5  # Save state when progress exceeds this delta
     max_checkpoints: int = 100  # Maximum number of checkpoints to keep
@@ -66,7 +120,7 @@ class Config:
     # Logging
     wandb_project: str = "pokemon-red-vlm"
     log_interval: int = 10
-    checkpoint_interval: int = 1000
+    checkpoint_interval: int = 10_000_000  # Only save final checkpoint
 
 
 # ============================================================================
@@ -112,6 +166,19 @@ class ProgressCheckpointer:
 
         for i, env_idx in enumerate(env_indices):
             score = float(progress_scores[i])
+            frame = frames[env_idx]
+
+            # Skip blank frames - don't save them as checkpoints
+            if is_blank_frame(frame):
+                continue
+
+            # IMPORTANT: Only save states with positive progress scores
+            # This prevents saving intro/title states as checkpoints
+            # Late gameplay scores around +3 to +6, intro around -3 to +3
+            # We use 2.0 as threshold to ensure we only save actual gameplay
+            MIN_CHECKPOINT_SCORE = 2.0
+            if score < MIN_CHECKPOINT_SCORE:
+                continue
 
             # Check if this represents a new milestone
             should_save = False
@@ -126,8 +193,8 @@ class ProgressCheckpointer:
 
             if should_save:
                 state_id = env.save_state(env_idx)
-                frame = frames[env_idx].copy()  # Store a copy of the frame
-                self._insert_checkpoint(score, state_id, frame)
+                frame_copy = frame.copy()  # Store a copy of the frame
+                self._insert_checkpoint(score, state_id, frame_copy)
                 new_checkpoints += 1
 
         return new_checkpoints
@@ -329,6 +396,63 @@ class ProgressCheckpointer:
 
 
 # ============================================================================
+# NOVELTY TRACKER (for exploration bonus)
+# ============================================================================
+
+class NoveltyTracker:
+    """
+    Tracks visited score levels and provides novelty bonus for reaching new ones.
+
+    This encourages exploration by rewarding the agent for reaching score levels
+    it hasn't seen before. Uses score buckets to group similar scores together.
+    """
+
+    def __init__(self, bucket_size: float = 0.5):
+        self.bucket_size = bucket_size
+        self.visited_buckets = set()  # Global set of visited score buckets
+        self.env_last_bucket = {}  # Per-env tracking of last bucket
+
+    def _get_bucket(self, score: float) -> int:
+        """Convert score to bucket index."""
+        return int(score / self.bucket_size)
+
+    def compute_novelty_bonus(self, scores: np.ndarray, env_indices: list = None) -> np.ndarray:
+        """
+        Compute novelty bonus for each environment based on score.
+
+        Returns bonus of 1.0 for reaching a new global bucket, 0.0 otherwise.
+        """
+        if env_indices is None:
+            env_indices = list(range(len(scores)))
+
+        bonuses = np.zeros(len(scores), dtype=np.float32)
+
+        for i, env_idx in enumerate(env_indices):
+            score = float(scores[i])
+            bucket = self._get_bucket(score)
+
+            # Check if this bucket is new (globally)
+            if bucket not in self.visited_buckets:
+                bonuses[i] = 1.0
+                self.visited_buckets.add(bucket)
+
+            # Update per-env tracking
+            self.env_last_bucket[env_idx] = bucket
+
+        return bonuses
+
+    def get_stats(self):
+        """Get novelty tracking statistics."""
+        if not self.visited_buckets:
+            return {'visited_buckets': 0, 'bucket_range': (0, 0)}
+        buckets = list(self.visited_buckets)
+        return {
+            'visited_buckets': len(buckets),
+            'bucket_range': (min(buckets) * self.bucket_size, max(buckets) * self.bucket_size),
+        }
+
+
+# ============================================================================
 # CNN REWARD MODEL (ResNet from train_reward_cnn.py)
 # ============================================================================
 
@@ -409,6 +533,34 @@ def load_reward_model(path: str):
         model = ResNet()
 
     return model, data['params'], data['batch_stats']
+
+
+def load_sequence_reward_model(path: str):
+    """Load trained sequence reward model (transformer-based)."""
+    from train_reward_sequence import SequenceRewardModel, SequenceRewardConfig
+
+    with open(path, 'rb') as f:
+        data = pickle.load(f)
+
+    cfg = data['config']
+    config = SequenceRewardConfig(
+        seq_len=cfg.get('seq_len', 8),
+        vocab_size=cfg.get('vocab_size', 512),
+        embed_dim=cfg.get('embed_dim', 192),
+        encoder_channels=tuple(cfg.get('encoder_channels', (32, 64, 128, 192))),
+        num_layers=cfg.get('num_layers', 4),
+        num_heads=cfg.get('num_heads', 4),
+    )
+
+    model = SequenceRewardModel(config)
+
+    # Handle nested params structure
+    params = data['params']
+    if 'params' in params and 'params' in params['params']:
+        # Double nested - flatten one level
+        params = params['params']
+
+    return model, params, config
 
 
 # ============================================================================
@@ -769,7 +921,9 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--reward-model", type=str, required=True,
-                        help="Path to trained CNN reward model (frozen)")
+                        help="Path to trained reward model (CNN or sequence)")
+    parser.add_argument("--sequence-reward", action="store_true",
+                        help="Use sequence-based reward model (transformer)")
     parser.add_argument("--pretrained-tokenizer", type=str, default=None,
                         help="Path to pretrained tokenizer (encoder + quantizer)")
     parser.add_argument("--pretrained-dynamics", type=str, default=None,
@@ -792,21 +946,57 @@ def main():
 
     # Load reward model
     print(f"Loading reward model: {args.reward_model}")
-    reward_model, reward_params, reward_batch_stats = load_reward_model(args.reward_model)
+    use_sequence_reward = args.sequence_reward
+    seq_reward_config = None
 
-    # JIT compile reward function
-    @jax.jit
-    def compute_rewards(frames):
-        """Compute progress scores for a batch of frames."""
-        return reward_model.apply(
-            {'params': reward_params, 'batch_stats': reward_batch_stats},
-            frames, train=False
+    if use_sequence_reward:
+        reward_model, reward_params, seq_reward_config = load_sequence_reward_model(args.reward_model)
+        seq_len = seq_reward_config.seq_len
+        frame_skip_reward = seq_reward_config.frame_skip
+        print(f"  Sequence reward model: seq_len={seq_len}, frame_skip={frame_skip_reward}")
+
+        # Initialize frame buffer for sequences
+        frame_buffer = np.zeros(
+            (config.num_envs, seq_len, 144, 160, 3),
+            dtype=np.uint8
         )
+        frame_buffer_idx = 0
 
-    # Test reward model
-    test_frame = jnp.zeros((1, 144, 160, 3), dtype=jnp.uint8)
-    test_score = compute_rewards(test_frame)
-    print(f"Reward model test score: {float(test_score[0]):.4f}")
+        @jax.jit
+        def compute_sequence_rewards(sequences):
+            """Compute progress scores for sequences. Shape: (B, seq_len, H, W, C)"""
+            # reward_params is already {'params': {...}}, so pass directly
+            return reward_model.apply(reward_params, sequences, train=False)
+
+        # Test
+        test_seq = jnp.zeros((1, seq_len, 144, 160, 3), dtype=jnp.uint8)
+        test_score = compute_sequence_rewards(test_seq)
+        print(f"Reward model test score: {float(test_score[0]):.4f}")
+
+        # Wrapper for compatibility
+        def compute_rewards(frames):
+            """For sequence model, build sequences from recent frames."""
+            # This is called with single frames, so we need to handle buffering
+            # For now, just duplicate the frame to make a sequence
+            B = frames.shape[0]
+            seq = jnp.broadcast_to(frames[:, None], (B, seq_len, 144, 160, 3))
+            return compute_sequence_rewards(seq)
+
+    else:
+        reward_model, reward_params, reward_batch_stats = load_reward_model(args.reward_model)
+
+        @jax.jit
+        def compute_rewards(frames):
+            """Compute progress scores for a batch of frames."""
+            return reward_model.apply(
+                {'params': reward_params, 'batch_stats': reward_batch_stats},
+                frames, train=False
+            )
+
+        # Test reward model
+        test_frame = jnp.zeros((1, 144, 160, 3), dtype=jnp.uint8)
+        test_score = compute_rewards(test_frame)
+        print(f"Reward model test score: {float(test_score[0]):.4f}")
 
     # Initialize wandb with full config
     wandb_run = None
@@ -847,6 +1037,9 @@ def main():
     checkpointer = ProgressCheckpointer(config)
     checkpoint_rng = np.random.default_rng(42)
 
+    # Initialize novelty tracker for exploration bonus
+    novelty_tracker = NoveltyTracker(bucket_size=config.novelty_bucket_size)
+
     # Initialize policy
     key = jax.random.PRNGKey(int(time.time()))
 
@@ -878,18 +1071,20 @@ def main():
         start_iteration = checkpoint.get('iteration', 0)
         print(f"  Resumed at iteration {start_iteration}")
 
-    # JIT compile policy functions
+    # JIT compile policy functions - capture apply_fn in closure
+    apply_fn = state.apply_fn
+
     @jax.jit
-    def select_action(state, frames, key):
-        logits, value = state.apply_fn(state.params, frames, train=False)
+    def _select_action_impl(params, frames, key):
+        logits, value = apply_fn(params, frames, train=False)
         # Clip logits for numerical stability (consistent with ppo_update)
         logits = jnp.clip(logits, -20.0, 20.0)
         action = jax.random.categorical(key, logits)
         log_prob = jax.nn.log_softmax(logits)[jnp.arange(len(action)), action]
         return action, log_prob, value
 
-    @jax.jit
-    def ppo_update(state, frames, actions, returns, old_log_probs, rng_key):
+    def _ppo_update_single(state, frames, actions, returns, old_log_probs, rng_key):
+        """Single-device PPO update step."""
         def loss_fn(params):
             logits, values = state.apply_fn(params, frames, train=True, rngs={'dropout': rng_key})
 
@@ -930,7 +1125,27 @@ def main():
         metrics['grad_norm'] = grad_norm
         return state.apply_gradients(grads=grads), metrics
 
+    # Single GPU training (multi-GPU disabled for stability)
+    ppo_update = jax.jit(_ppo_update_single)
+    use_pmap = False
+
+    def select_action(state, frames, key):
+        return _select_action_impl(state.params, frames, key)
+
     env.reset(obs)
+
+    # Fast-forward through intro screens to actual gameplay
+    # This skips: Game Freak logo, title screen, Oak intro, naming
+    print("Fast-forwarding through intro screens...")
+    INTRO_STEPS = 6000  # ~3 minutes at 30fps frame_skip
+    for step in range(INTRO_STEPS):
+        # Alternate Start and A to skip through menus
+        if step % 3 == 0:
+            buttons = np.full(config.num_envs, 128, dtype=np.uint8)  # Start
+        else:
+            buttons = np.full(config.num_envs, 16, dtype=np.uint8)   # A
+        env.step(buttons, obs)
+    print(f"  Skipped {INTRO_STEPS} intro steps, now in gameplay")
 
     print(f"\nTraining config:")
     print(f"  Iterations: {start_iteration} -> {args.iterations}")
@@ -959,7 +1174,9 @@ def main():
             all_actions.append(actions_np)
             all_log_probs.append(np.array(log_probs))
 
-            env.step(actions_np, obs)
+            # Map action indices to proper button bitmasks
+            button_np = ACTION_TO_BUTTON[actions_np]
+            env.step(button_np, obs)
 
         rollout_time = time.time() - t0
         total_frames += config.num_envs * config.trajectory_length * config.frame_skip
@@ -978,14 +1195,34 @@ def main():
             reward_frames.append(all_frames[idx])  # (num_envs, H, W, C)
         reward_frames = np.concatenate(reward_frames, axis=0)  # (num_indices * num_envs, H, W, C)
 
-        # Get progress scores
-        progress_scores = compute_rewards(jnp.array(reward_frames))
-        progress_scores = np.array(progress_scores).reshape(len(reward_indices), config.num_envs)
+        # Detect blank frames and handle them specially
+        blank_mask = get_blank_mask(reward_frames)
+        non_blank_frames = reward_frames[~blank_mask]
+
+        # Get progress scores for non-blank frames only
+        if len(non_blank_frames) > 0:
+            non_blank_scores = compute_rewards(jnp.array(non_blank_frames))
+            non_blank_scores = np.array(non_blank_scores)
+        else:
+            non_blank_scores = np.array([])
+
+        # Reconstruct full score array with blank frames getting BLANK_FRAME_SCORE
+        all_scores = np.full(len(reward_frames), BLANK_FRAME_SCORE, dtype=np.float32)
+        all_scores[~blank_mask] = non_blank_scores
+
+        progress_scores = all_scores.reshape(len(reward_indices), config.num_envs)
 
         # Update checkpointer with final progress scores (last frame of trajectory)
         final_progress = progress_scores[-1]  # (num_envs,)
         final_frames = all_frames[-1]  # (num_envs, 144, 160, 3)
         new_checkpoints = checkpointer.update(env, final_progress, final_frames)
+
+        # Compute novelty bonus for reaching new score buckets
+        novelty_bonuses = np.zeros((len(reward_indices), config.num_envs), dtype=np.float32)
+        for t_idx in range(len(reward_indices)):
+            novelty_bonuses[t_idx] = novelty_tracker.compute_novelty_bonus(
+                progress_scores[t_idx]
+            )
 
         # Convert to per-step rewards via interpolation
         all_rewards = np.zeros((config.num_envs, config.trajectory_length), dtype=np.float32)
@@ -996,8 +1233,24 @@ def main():
                 reward_indices,
                 scores
             )
-            # Reward = progress delta - time penalty
-            all_rewards[env_idx, 1:] = full_scores[1:] - full_scores[:-1] - config.time_penalty
+            # Progress delta (score change)
+            delta = full_scores[1:] - full_scores[:-1]
+
+            # IMPORTANT: Don't penalize going through low-score regions (exploration)
+            # Only reward positive progress, ignore negative progress
+            # This allows agent to explore through "valleys" to reach peaks
+            positive_delta = np.maximum(0, delta)
+
+            # Interpolate novelty bonus to per-step
+            novelty = novelty_bonuses[:, env_idx]
+            full_novelty = np.interp(
+                range(config.trajectory_length),
+                reward_indices,
+                novelty
+            )
+
+            # Reward = positive progress + novelty bonus - time penalty
+            all_rewards[env_idx, 1:] = positive_delta + config.novelty_coef * full_novelty[1:] - config.time_penalty
 
         reward_time = time.time() - t1
 
@@ -1054,14 +1307,37 @@ def main():
             end = min(start + config.minibatch_size, B)
             idx = perm[start:end]
             key, dropout_key = jax.random.split(key)
-            state, metrics = ppo_update(
-                state,
-                frames_flat[idx],
-                actions_flat[idx],
-                returns_flat[idx],
-                log_probs_flat[idx],
-                dropout_key
-            )
+
+            if use_pmap:
+                # Reshape data for multi-GPU: (num_devices, batch_per_device, ...)
+                mb_size = len(idx)
+                # Pad to be divisible by NUM_DEVICES
+                pad_size = (NUM_DEVICES - mb_size % NUM_DEVICES) % NUM_DEVICES
+                if pad_size > 0:
+                    idx = jnp.concatenate([idx, idx[:pad_size]])
+                mb_size = len(idx)
+                per_device = mb_size // NUM_DEVICES
+
+                frames_mb = frames_flat[idx].reshape(NUM_DEVICES, per_device, 144, 160, 3)
+                actions_mb = actions_flat[idx].reshape(NUM_DEVICES, per_device)
+                returns_mb = returns_flat[idx].reshape(NUM_DEVICES, per_device)
+                log_probs_mb = log_probs_flat[idx].reshape(NUM_DEVICES, per_device)
+                dropout_keys = jax.random.split(dropout_key, NUM_DEVICES)
+
+                state, metrics = ppo_update(
+                    state, frames_mb, actions_mb, returns_mb, log_probs_mb, dropout_keys
+                )
+                # Average metrics across devices
+                metrics = jax.tree_util.tree_map(lambda x: x.mean(), metrics)
+            else:
+                state, metrics = ppo_update(
+                    state,
+                    frames_flat[idx],
+                    actions_flat[idx],
+                    returns_flat[idx],
+                    log_probs_flat[idx],
+                    dropout_key
+                )
             metrics_list.append(metrics)
 
         training_time = time.time() - t2
@@ -1079,11 +1355,13 @@ def main():
             avg_entropy = np.mean([float(m['entropy']) for m in metrics_list])
             avg_grad_norm = np.mean([float(m['grad_norm']) for m in metrics_list])
             ckpt_stats = checkpointer.get_stats()
+            novelty_stats = novelty_tracker.get_stats()
 
             prog_range = ckpt_stats['progress_range']
             print(f"[{iteration:5d}] reward={avg_reward:+.4f} | "
                   f"ent={avg_entropy:.3f} | "
                   f"ckpts={ckpt_stats['num_checkpoints']} prog=[{prog_range[0]:.1f},{prog_range[1]:.1f}] | "
+                  f"novelty={novelty_stats['visited_buckets']} | "
                   f"{fps/1000:.0f}K fps")
 
             if wandb_run:
@@ -1131,9 +1409,14 @@ def main():
     checkpointer.save_checkpoint_frames("checkpoints/frames_final")
 
     # Save final policy
+    # If using pmap, extract single copy of params (they're replicated)
+    params_to_save = state.params
+    if use_pmap:
+        params_to_save = jax.tree_util.tree_map(lambda x: x[0], state.params)
+
     with open("checkpoints/policy_final.pkl", 'wb') as f:
         pickle.dump({
-            'params': state.params,
+            'params': params_to_save,
             'config': asdict(config),
             'iteration': args.iterations,
         }, f)

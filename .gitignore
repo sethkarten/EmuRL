@@ -8,10 +8,19 @@ __pycache__/
 dist/
 build/
 
-# Data (large files)
+# Data (large files - store externally)
 data/
 *.pkl
 *.npy
+
+# Training artifacts
+debug_frames/
+debug_speedrun/
+reward_*/
+initial_states.bin
+
+# Video crop config has local paths (collaborators copy from example)
+configs/video_crop_config.json
 
 # Checkpoints
 checkpoints/
