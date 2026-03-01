@@ -41,3 +41,7 @@ roms/
 *.png
 *.log
 uv.lock
+
+# data
+data/*
+!data/.gitkeep

@@ -5,12 +5,11 @@ Run directly:
     python download_letsplay_playlist.py
 """
 import subprocess
-import sys
 from pathlib import Path
 
 # Configuration
-PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLR2FYtFWHTrWr4lpB9zgdfx0yno9FRz3S"
-OUTPUT_DIR = Path("/mnt/storage/datasets/pokemon_red_letsplay")
+PLAYLIST_URL = "https://www.youtube.com/playlist?list=PL_nNLjnmYJnnOwZx-7AcdnaNDGXQIa9hL"
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data/dummy"
 
 
 def main():

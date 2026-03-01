@@ -3,7 +3,6 @@
 ## Project Notes
 
 - Always use `uv run python` (not conda)
-- UV cache: `UV_CACHE_DIR=/media/milkkarten/data/cache/uv`
 - Emulator: `from emurust import VecGameBoy`
 
 ---
@@ -22,7 +21,7 @@ We train an RL agent to play Pokemon Red using a VLM-inspired architecture. The 
 
 ### Pipeline
 
-```
+``` bash
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  Phase 1: Visual Pretraining (unlabeled speedrun videos)                │
 │  ┌─────────────────┐    ┌─────────────────┐                             │
@@ -64,6 +63,7 @@ We train an RL agent to play Pokemon Red using a VLM-inspired architecture. The 
 ### Compact Architecture (~7M params per model, bf16)
 
 All models use bf16 training for speed. Key dimensions:
+
 - `embed_dim = 192`
 - `encoder_channels = (32, 64, 128, 192)`
 - `num_layers = 4`, `num_heads = 4`, `mlp_ratio = 3`
@@ -74,6 +74,7 @@ All models use bf16 training for speed. Key dimensions:
 Train on speedrun videos (no actions needed).
 
 #### Stage 1A: VQ-VAE Tokenizer (~5M params)
+
 ```python
 # Architecture: CNN encoder -> VQ codebook -> CNN decoder
 # Converts frames to discrete token grids (like image tokenizer for VLMs)
@@ -87,6 +88,7 @@ loss = MSE(recon, frame) + codebook_loss + 0.25 * commitment_loss
 ```
 
 #### Stage 1B: Dynamics Model (Next Token Prediction)
+
 ```python
 # Architecture: Transformer over token sequence
 # Predicts next frame's tokens from current frame's tokens
@@ -110,10 +112,12 @@ loss = CrossEntropy(logits, tokens_t1_true)
 Two options available:
 
 #### Option A: ResNet-34 (legacy, standalone)
+
 - ResNet-34 trained on speedrun frame ordering
 - `reward_resnet34.pkl` (88.7% pairwise accuracy)
 
 #### Option B: VQ-based (uses shared backbone)
+
 - VQ Encoder (frozen from Stage 1A) -> MLP head -> progress score
 - Trained with `train_reward.py`
 - Shares encoder+codebook with policy for consistency
@@ -123,7 +127,8 @@ Two options available:
 ### Phase 3: RL Training (PPO)
 
 #### Architecture (VLM-style)
-```
+
+``` bash
 frame -> VQ Encoder -> tokens (9x10) -> TokenTransformer -> pooled -> policy logits
                     -> codebook      -> embeddings (90x256)        -> value estimate
 
@@ -135,6 +140,7 @@ frame -> VQ Encoder -> tokens (9x10) -> TokenTransformer -> pooled -> policy log
 which transfers well to policy learning ("what action leads to good outcomes").
 
 #### Key Settings
+
 ```python
 frame_skip = 30              # 32s game time per reward computation
 reward_interval = 64         # Steps between reward computation
@@ -144,12 +150,14 @@ gamma = 0.99                 # Discount factor
 ```
 
 #### Reward Function
+
 ```python
 reward = progress_delta - time_penalty
 # where progress_delta = reward_model(frame_t+1) - reward_model(frame_t)
 ```
 
 #### Curriculum Learning
+
 - Save game states at progress milestones
 - Probabilistically reset envs to checkpoints
 - Weighted sampling toward higher progress states
@@ -159,17 +167,20 @@ reward = progress_delta - time_penalty
 ## Implementation Tasks
 
 ### DONE: Rewrite pretrain_visual.py (VQ-VAE)
+
 - [x] Stage 1A: VQ-VAE tokenizer (encoder + codebook + decoder)
 - [x] Stage 1B: Transformer dynamics (next token prediction)
 - [x] Export encoder + codebook for RL (`pretrained_encoder.pkl`)
 
 ### DONE: Update train_with_cnn_reward.py (VLM-style)
+
 - [x] Add VQPolicy: VQ encoder -> token embeddings -> transformer -> policy/value
 - [x] Load pretrained encoder + codebook weights
 - [x] Keep legacy ViT policy for backward compatibility
 - [ ] Verify return filtering works (--return-filter 0.8)
 
 ### DONE: OOD Detection for Counterfactual States
+
 - [x] Created `ood_detector.py` for detecting out-of-distribution states
 - [x] Reconstruction-based OOD: VQ-VAE reconstruction error
 - [x] Temporal OOD: Dynamics model prediction accuracy
@@ -185,6 +196,7 @@ adjusted_rewards = rewards * reward_mult
 ```
 
 ### IN PROGRESS: Expand Training Data
+
 - [x] Scraped 1505 speedrun video URLs from speedrun.com API
 - [x] Created `scrape_speedruns.py` for video download and frame extraction
 - [ ] Download 50 videos to `/mnt/storage/datasets/pokemon_red_speedruns/`
@@ -192,10 +204,12 @@ adjusted_rewards = rewards * reward_mult
 - [ ] Retrain reward model on expanded data
 
 ### TODO: Fix intro problem
+
 - Agent gets stuck in title screen (never presses Start)
 - Solution: Expanded data + OOD penalty should help guide agent past intro
 
 ### TODO: Evaluation
+
 - [ ] Compare trained vs random agent
 - [ ] Visualize trajectories (GIF output)
 - [ ] Track checkpoints reached over training
@@ -276,9 +290,11 @@ uv run python ood_detector.py --tokenizer pretrained_tokenizer.pkl \
 ### VQ-VAE Observations (100 epochs)
 
 **Codebook usage**: Stabilized at ~45% (228 of 512 codes active)
+
 - Much better than initial collapse to 17-20%
 
 **Training metrics (100 epochs):**
+
 - Tokenizer (3.9M params): Recon 0.061→0.007, VQ loss 0.52→0.012
 - Dynamics (1.6M params): Accuracy 51%→72% next-token prediction
 - Training time: ~15 min (tokenizer) + ~5 min (dynamics)

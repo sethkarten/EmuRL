@@ -167,7 +167,7 @@ def download_video(video_url: str, output_dir: Path, video_id: str) -> Optional[
             return None
 
     except subprocess.TimeoutExpired:
-        print(f"  Download timed out (30min)")
+        print("  Download timed out (30min)")
         return None
     except Exception as e:
         print(f"  Error: {e}")
@@ -235,7 +235,7 @@ def main():
     print(f"\nSaved metadata to {metadata_path}")
 
     # Print summary
-    print(f"\nTop videos found:")
+    print("\nTop videos found:")
     for i, video in enumerate(filtered[:10]):
         duration_min = (video.get('duration') or 0) // 60
         print(f"  {i+1}. [{duration_min}min] {video.get('title', 'Unknown')[:60]}")

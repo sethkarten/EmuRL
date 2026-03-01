@@ -6,7 +6,6 @@ Run directly (not through Claude sandbox):
 """
 import json
 import subprocess
-import sys
 from pathlib import Path
 
 # Configuration
@@ -109,7 +108,7 @@ def main():
             print(f"  Success! Saved to {output_path}")
             downloaded += 1
         else:
-            print(f"  Failed, trying next...")
+            print("  Failed, trying next...")
 
     print(f"\nDownloaded {downloaded} videos to {OUTPUT_DIR}")
     print(f"Skipped {skipped} existing videos")

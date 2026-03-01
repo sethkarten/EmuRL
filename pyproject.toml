@@ -1,18 +1,18 @@
 [project]
-name = "emurl"
+name = "pokemon-rl"
 version = "0.1.0"
-description = "RL training framework for emulated games (Pokemon Red)"
+description = "RL training framework for emulated games (Pokemon Emerald)"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
-    "jax[cuda12]>=0.4.20",
+    "jax>=0.4.20",
     "flax>=0.8.0",
     "optax>=0.1.7",
     "pillow>=10.0",
     "wandb>=0.16",
     "yt-dlp>=2024.1",
     "opencv-python>=4.8",
-    "emurust",
+    # "emurust" ,
 ]
 
 [project.optional-dependencies]
@@ -23,4 +23,4 @@ dev = [
 ]
 
 [tool.uv.sources]
-emurust = { path = "../EmuRust", editable = true }
+# emurust = { path = "../ ", editable = true }
