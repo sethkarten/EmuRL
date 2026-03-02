@@ -9,7 +9,8 @@ dist/
 build/
 
 # Data (large files - store externally)
-data/
+data/*
+!data/.gitkeep
 *.pkl
 *.npy
 
@@ -28,7 +29,8 @@ wandb/
 eval_output/
 
 # ROMs (copyrighted)
-roms/
+roms/*
+!roms/.gitkeep
 *.gb
 *.gbc
 
@@ -41,7 +43,3 @@ roms/
 *.png
 *.log
 uv.lock
-
-# data
-data/*
-!data/.gitkeep
