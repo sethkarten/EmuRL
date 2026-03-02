@@ -18,8 +18,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from data_collection.preprocess_videos import (
-    GB_HEIGHT,
-    GB_WIDTH,
+    GBA_HEIGHT,
+    GBA_WIDTH,
     ScreenRegion,
     get_video_crop_region,
     is_gameplay_frame,
@@ -158,13 +158,13 @@ class TestScreenRegionCrop:
         region = ScreenRegion(x=10, y=10, width=320, height=288, confidence=1.0)
         frame = self._bgr_frame(480, 640)
         result = region.crop(frame)
-        assert result.shape == (GB_HEIGHT, GB_WIDTH, 3)
+        assert result.shape == (GBA_HEIGHT, GBA_WIDTH, 3)
 
     def test_crop_full_frame(self):
         region = ScreenRegion(x=0, y=0, width=160, height=144, confidence=1.0)
         frame = self._bgr_frame(144, 160)
         result = region.crop(frame)
-        assert result.shape == (GB_HEIGHT, GB_WIDTH, 3)
+        assert result.shape == (GBA_HEIGHT, GBA_WIDTH, 3)
 
     def test_dtype_preserved(self):
         region = ScreenRegion(x=0, y=0, width=160, height=144, confidence=1.0)

@@ -3,11 +3,11 @@
 Preprocess Pokemon Red gameplay videos for training.
 
 This script handles:
-1. Game Boy screen cropping using manual config (video_crop_config.json)
+1. Game Boy Advance screen cropping using manual config (video_crop_config.json)
 2. Non-gameplay frame filtering (intros, outros, pauses)
-3. Frame extraction at consistent resolution (160x144)
+3. Frame extraction at consistent resolution (240x160)
 
-The Game Boy screen is 160x144 pixels. Videos may have:
+The Game Boy Advance screen is 240x160 pixels. Videos may have:
 - Borders/bezels around the screen
 - Facecam overlays
 - Commentary text
@@ -30,10 +30,10 @@ import json
 from dataclasses import dataclass
 
 
-# Game Boy screen dimensions
-GB_WIDTH = 160
-GB_HEIGHT = 144
-GB_ASPECT = GB_WIDTH / GB_HEIGHT  # ~1.11
+# Game Boy Advance screen dimensions
+GBA_WIDTH = 240
+GBA_HEIGHT = 160
+GBA_ASPECT = GBA_WIDTH / GBA_HEIGHT  # 1.5
 
 
 @dataclass
@@ -47,10 +47,10 @@ class ScreenRegion:
     confidence: float
 
     def crop(self, frame: np.ndarray) -> np.ndarray:
-        """Crop frame to this region and resize to GB resolution."""
+        """Crop frame to this region and resize to GBA resolution."""
         cropped = frame[self.y : self.y + self.height, self.x : self.x + self.width]
         resized = cv2.resize(
-            cropped, (GB_WIDTH, GB_HEIGHT), interpolation=cv2.INTER_AREA
+            cropped, (GBA_WIDTH, GBA_HEIGHT), interpolation=cv2.INTER_AREA
         )
         return resized
 
@@ -122,7 +122,7 @@ def detect_game_screen_by_edges(frame: np.ndarray) -> Optional[ScreenRegion]:
 
         # Check aspect ratio (should be close to GB aspect)
         aspect = w / h if h > 0 else 0
-        aspect_diff = abs(aspect - GB_ASPECT)
+        aspect_diff = abs(aspect - GBA_ASPECT)
 
         if aspect_diff > 0.3:  # Allow some tolerance
             continue
@@ -159,7 +159,7 @@ def detect_game_screen_by_color(frame: np.ndarray) -> Optional[ScreenRegion]:
 
     for scale in [0.3, 0.4, 0.5, 0.6, 0.7]:
         win_w = int(w * scale)
-        win_h = int(win_w / GB_ASPECT)
+        win_h = int(win_w / GBA_ASPECT)
 
         if win_h > h:
             continue
@@ -216,7 +216,7 @@ def detect_game_screen_by_template(
         # Try multiple scales
         for scale in [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]:
             scaled_w = int(frame.shape[1] * scale)
-            scaled_h = int(scaled_w / GB_ASPECT)
+            scaled_h = int(scaled_w / GBA_ASPECT)
 
             if scaled_h > frame.shape[0]:
                 continue
@@ -261,15 +261,15 @@ def detect_game_screen(
 
     # Fallback: assume game fills most of the frame
     h, w = frame.shape[:2]
-    # Find largest region with GB aspect ratio
-    if w / h > GB_ASPECT:
-        # Frame is wider than GB, crop sides
-        new_w = int(h * GB_ASPECT)
+    # Find largest region with GBA aspect ratio
+    if w / h > GBA_ASPECT:
+        # Frame is wider than GBA, crop sides
+        new_w = int(h * GBA_ASPECT)
         x = (w - new_w) // 2
         return ScreenRegion(x, 0, new_w, h, 0.5)
     else:
-        # Frame is taller than GB, crop top/bottom
-        new_h = int(w / GB_ASPECT)
+        # Frame is taller than GBA, crop top/bottom
+        new_h = int(w / GBA_ASPECT)
         y = (h - new_h) // 2
         return ScreenRegion(0, y, w, new_h, 0.5)
 
@@ -313,7 +313,7 @@ def load_template_frames(
         for npy_file in npy_files[100 : 100 + max_templates // 3]:
             try:
                 frame = np.load(npy_file)
-                if frame.shape == (144, 160, 3):
+                if frame.shape == (GBA_HEIGHT, GBA_WIDTH, 3):
                     # Convert to BGR for OpenCV
                     templates.append(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             except Exception:
@@ -394,9 +394,9 @@ def process_video(
         ret, frame = cap.read()
         if ret:
             h, w = frame.shape[:2]
-            new_h = int(w / GB_ASPECT)
+            new_h = int(w / GBA_ASPECT)
             if new_h > h:
-                new_w = int(h * GB_ASPECT)
+                new_w = int(h * GBA_ASPECT)
                 region = ScreenRegion((w - new_w) // 2, 0, new_w, h, 0.3)
             else:
                 region = ScreenRegion(0, (h - new_h) // 2, w, new_h, 0.3)
