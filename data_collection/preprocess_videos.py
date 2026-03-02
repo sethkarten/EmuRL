@@ -25,11 +25,9 @@ import cv2
 import numpy as np
 from pathlib import Path
 import argparse
-from typing import Tuple, Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any
 import json
 from dataclasses import dataclass
-from concurrent.futures import ProcessPoolExecutor
-import subprocess
 
 
 # Game Boy screen dimensions
@@ -41,6 +39,7 @@ GB_ASPECT = GB_WIDTH / GB_HEIGHT  # ~1.11
 @dataclass
 class ScreenRegion:
     """Detected game screen region."""
+
     x: int
     y: int
     width: int
@@ -49,8 +48,10 @@ class ScreenRegion:
 
     def crop(self, frame: np.ndarray) -> np.ndarray:
         """Crop frame to this region and resize to GB resolution."""
-        cropped = frame[self.y:self.y+self.height, self.x:self.x+self.width]
-        resized = cv2.resize(cropped, (GB_WIDTH, GB_HEIGHT), interpolation=cv2.INTER_AREA)
+        cropped = frame[self.y : self.y + self.height, self.x : self.x + self.width]
+        resized = cv2.resize(
+            cropped, (GB_WIDTH, GB_HEIGHT), interpolation=cv2.INTER_AREA
+        )
         return resized
 
 
@@ -145,8 +146,6 @@ def detect_game_screen_by_color(frame: np.ndarray) -> Optional[ScreenRegion]:
     Game Boy games have limited color palettes. We look for regions
     with colors typical of Pokemon Red (greens, blues, browns).
     """
-    # Convert to HSV for better color analysis
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
     # Game Boy Color palette tends to have specific saturation ranges
     # Look for regions with consistent, limited color variation
@@ -168,7 +167,7 @@ def detect_game_screen_by_color(frame: np.ndarray) -> Optional[ScreenRegion]:
         # Slide window across frame
         for y in range(0, h - win_h, win_h // 4):
             for x in range(0, w - win_w, win_w // 4):
-                window = frame[y:y+win_h, x:x+win_w]
+                window = frame[y : y + win_h, x : x + win_w]
 
                 # Check for limited color palette (Game Boy characteristic)
                 unique_colors = len(np.unique(window.reshape(-1, 3), axis=0))
@@ -196,8 +195,7 @@ def detect_game_screen_by_color(frame: np.ndarray) -> Optional[ScreenRegion]:
 
 
 def detect_game_screen_by_template(
-    frame: np.ndarray,
-    template_frames: List[np.ndarray]
+    frame: np.ndarray, template_frames: List[np.ndarray]
 ) -> Optional[ScreenRegion]:
     """
     Detect game screen by matching against known game frames.
@@ -233,17 +231,14 @@ def detect_game_screen_by_template(
             if max_val > best_score and max_val > 0.5:
                 best_score = max_val
                 best_region = ScreenRegion(
-                    max_loc[0], max_loc[1],
-                    scaled_w, scaled_h,
-                    max_val
+                    max_loc[0], max_loc[1], scaled_w, scaled_h, max_val
                 )
 
     return best_region
 
 
 def detect_game_screen(
-    frame: np.ndarray,
-    template_frames: Optional[List[np.ndarray]] = None
+    frame: np.ndarray, template_frames: Optional[List[np.ndarray]] = None
 ) -> Optional[ScreenRegion]:
     """
     Detect game screen using multiple methods.
@@ -300,7 +295,9 @@ def is_gameplay_frame(frame: np.ndarray) -> bool:
     return True
 
 
-def load_template_frames(template_dir: Path, max_templates: int = 10) -> List[np.ndarray]:
+def load_template_frames(
+    template_dir: Path, max_templates: int = 10
+) -> List[np.ndarray]:
     """Load template frames from existing dataset."""
     templates = []
 
@@ -313,13 +310,13 @@ def load_template_frames(template_dir: Path, max_templates: int = 10) -> List[np
             continue
 
         npy_files = sorted(video_dir.glob("*.npy"))
-        for npy_file in npy_files[100:100 + max_templates // 3]:
+        for npy_file in npy_files[100 : 100 + max_templates // 3]:
             try:
                 frame = np.load(npy_file)
                 if frame.shape == (144, 160, 3):
                     # Convert to BGR for OpenCV
                     templates.append(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            except:
+            except Exception:
                 continue
 
     return templates
@@ -345,7 +342,7 @@ def process_video(
         skip_reason = should_skip_video(video_id, crop_config)
         if skip_reason:
             print(f"Skipping {video_id}: {skip_reason}")
-            return {'video_id': video_id, 'status': 'skipped', 'reason': skip_reason}
+            return {"video_id": video_id, "status": "skipped", "reason": skip_reason}
 
     frames_dir = output_dir / video_id
     frames_dir.mkdir(parents=True, exist_ok=True)
@@ -354,15 +351,15 @@ def process_video(
     existing_frames = list(frames_dir.glob("*.npy"))
     if len(existing_frames) > 100:
         return {
-            'video_id': video_id,
-            'status': 'already_processed',
-            'frames': len(existing_frames),
+            "video_id": video_id,
+            "status": "already_processed",
+            "frames": len(existing_frames),
         }
 
     # Open video
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        return {'video_id': video_id, 'status': 'error', 'error': 'Cannot open video'}
+        return {"video_id": video_id, "status": "error", "error": "Cannot open video"}
 
     video_fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -376,7 +373,9 @@ def process_video(
     if crop_config:
         region = get_video_crop_region(video_id, crop_config)
         if region:
-            print(f"  Using configured crop: ({region.x}, {region.y}) {region.width}x{region.height}")
+            print(
+                f"  Using configured crop: ({region.x}, {region.y}) {region.width}x{region.height}"
+            )
 
     # Fallback to auto-detection if no config
     if region is None:
@@ -402,7 +401,9 @@ def process_video(
             else:
                 region = ScreenRegion(0, (h - new_h) // 2, w, new_h, 0.3)
 
-    print(f"  Screen region: ({region.x}, {region.y}) {region.width}x{region.height} (conf: {region.confidence:.2f})")
+    print(
+        f"  Screen region: ({region.x}, {region.y}) {region.width}x{region.height} (conf: {region.confidence:.2f})"
+    )
 
     # Reset to beginning
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -427,7 +428,7 @@ def process_video(
             # Crop to game screen
             try:
                 cropped = region.crop(frame)
-            except:
+            except Exception:
                 frame_idx += 1
                 continue
 
@@ -446,7 +447,9 @@ def process_video(
             saved_count += 1
 
             if saved_count % 1000 == 0:
-                print(f"  Saved {saved_count} frames (skipped {skipped_count} non-gameplay)...")
+                print(
+                    f"  Saved {saved_count} frames (skipped {skipped_count} non-gameplay)..."
+                )
 
         frame_idx += 1
 
@@ -454,19 +457,21 @@ def process_video(
 
     # Save metadata
     metadata = {
-        'video_id': video_id,
-        'source_path': str(video_path),
-        'frames': saved_count,
-        'skipped': skipped_count,
-        'region': {
-            'x': region.x, 'y': region.y,
-            'width': region.width, 'height': region.height,
-            'confidence': region.confidence,
+        "video_id": video_id,
+        "source_path": str(video_path),
+        "frames": saved_count,
+        "skipped": skipped_count,
+        "region": {
+            "x": region.x,
+            "y": region.y,
+            "width": region.width,
+            "height": region.height,
+            "confidence": region.confidence,
         },
-        'fps': fps,
+        "fps": fps,
     }
 
-    with open(frames_dir / 'metadata.json', 'w') as f:
+    with open(frames_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
     print(f"  Done: {saved_count} frames saved, {skipped_count} skipped")
@@ -477,12 +482,24 @@ def process_video(
 def main():
     parser = argparse.ArgumentParser(description="Preprocess Pokemon videos")
     parser.add_argument("--input", type=str, help="Input video directory")
-    parser.add_argument("--output", type=str, required=True, help="Output frames directory")
-    parser.add_argument("--fps", type=float, default=2.0, help="Output frames per second")
-    parser.add_argument("--templates", type=str, default="data/speedruns/frames",
-                       help="Directory with template frames")
-    parser.add_argument("--config", type=str, default="video_crop_config.json",
-                       help="Crop configuration JSON file")
+    parser.add_argument(
+        "--output", type=str, required=True, help="Output frames directory"
+    )
+    parser.add_argument(
+        "--fps", type=float, default=2.0, help="Output frames per second"
+    )
+    parser.add_argument(
+        "--templates",
+        type=str,
+        default="data/speedruns/frames",
+        help="Directory with template frames",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="video_crop_config.json",
+        help="Crop configuration JSON file",
+    )
     parser.add_argument("--workers", type=int, default=2, help="Parallel workers")
     args = parser.parse_args()
 
@@ -492,7 +509,9 @@ def main():
     # Load crop configuration
     config_path = Path(args.config)
     crop_config = load_crop_config(config_path)
-    usable_count = len([k for k in crop_config.get("usable_videos", {}) if not k.startswith("_")])
+    usable_count = len(
+        [k for k in crop_config.get("usable_videos", {}) if not k.startswith("_")]
+    )
     skip_count = len(crop_config.get("skip_videos", {}))
     print(f"Loaded crop config: {usable_count} usable, {skip_count} skip")
 
@@ -505,8 +524,12 @@ def main():
     video_files = []
     if args.input:
         input_dir = Path(args.input)
-        video_files = list(input_dir.glob("*.mp4")) + list(input_dir.glob("*.mkv")) + \
-                      list(input_dir.glob("*.webm")) + list(input_dir.glob("*.avi"))
+        video_files = (
+            list(input_dir.glob("*.mp4"))
+            + list(input_dir.glob("*.mkv"))
+            + list(input_dir.glob("*.webm"))
+            + list(input_dir.glob("*.avi"))
+        )
     else:
         # Search in common video locations for videos matching config
         search_dirs = [
@@ -525,7 +548,9 @@ def main():
     # Process videos
     results = []
     for video_path in sorted(video_files):
-        result = process_video(video_path, output_dir, args.fps, templates, crop_config=crop_config)
+        result = process_video(
+            video_path, output_dir, args.fps, templates, crop_config=crop_config
+        )
         results.append(result)
 
     # Summary
@@ -533,21 +558,25 @@ def main():
     print("SUMMARY")
     print("=" * 60)
 
-    total_frames = sum(r.get('frames', 0) for r in results)
-    processed = sum(1 for r in results if r.get('status') != 'error')
+    total_frames = sum(r.get("frames", 0) for r in results)
+    processed = sum(1 for r in results if r.get("status") != "error")
 
     print(f"Videos processed: {processed}/{len(video_files)}")
     print(f"Total frames: {total_frames:,}")
     print(f"Output directory: {output_dir}")
 
     # Save overall metadata
-    with open(output_dir / 'dataset_info.json', 'w') as f:
-        json.dump({
-            'videos': len(video_files),
-            'total_frames': total_frames,
-            'fps': args.fps,
-            'results': results,
-        }, f, indent=2)
+    with open(output_dir / "dataset_info.json", "w") as f:
+        json.dump(
+            {
+                "videos": len(video_files),
+                "total_frames": total_frames,
+                "fps": args.fps,
+                "results": results,
+            },
+            f,
+            indent=2,
+        )
 
 
 if __name__ == "__main__":
