@@ -1,0 +1,21 @@
+{
+  "usable_videos": {
+    "ep_01_owRVh3-eZxM": {
+      "crop": [
+        0,
+        0,
+        640,
+        360
+      ]
+    },
+    "Rs6wk0oGUmU": {
+      "crop": [
+        23,
+        45,
+        478,
+        350
+      ]
+    }
+  },
+  "skip_videos": {}
+}

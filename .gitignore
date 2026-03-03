@@ -33,6 +33,7 @@ roms/*
 !roms/.gitkeep
 *.gb
 *.gbc
+*.gba
 
 # IDE
 .idea/

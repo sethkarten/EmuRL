@@ -254,10 +254,11 @@ def detect_game_screen(
     if region and region.confidence > 0.3:
         return region
 
-    # Method 3: Color analysis
-    region = detect_game_screen_by_color(frame)
-    if region:
-        return region
+    # -- NOT APPLICABLE FOR POKEMON EMERALD (GBA) IGNORE ---
+    # Method 3: Color analysis 
+    # region = detect_game_screen_by_color(frame)
+    # if region:
+    #     return region
 
     # Fallback: assume game fills most of the frame
     h, w = frame.shape[:2]
